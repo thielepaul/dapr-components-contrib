@@ -162,7 +162,7 @@ func (m *MQTT) Init(metadata bindings.Metadata) error {
 
 	// mqtt broker allows only one connection at a given time from a clientID.
 	producerClientID := fmt.Sprintf("%s-producer", m.metadata.clientID)
-	p, err := m.connect(producerClientID)
+	p, err := m.connect(producerClientID, nil)
 	if err != nil {
 		return err
 	}
@@ -252,44 +252,47 @@ func (m *MQTT) Read(ctx context.Context, handler bindings.Handler) error {
 
 	// mqtt broker allows only one connection at a given time from a clientID.
 	consumerClientID := fmt.Sprintf("%s-consumer", m.metadata.clientID)
-	c, err := m.connect(consumerClientID)
+	c, err := m.connect(consumerClientID, func(c mqtt.Client) {
+		m.logger.Debugf("mqtt subscribing to topic %s", m.metadata.topic)
+		token := c.Subscribe(m.metadata.topic, m.metadata.qos, func(client mqtt.Client, mqttMsg mqtt.Message) {
+			var b backoff.BackOff = backoff.WithContext(m.backOff, ctx)
+			if m.metadata.backOffMaxRetries >= 0 {
+				b = backoff.WithMaxRetries(b, uint64(m.metadata.backOffMaxRetries))
+			}
+
+			if err := retry.NotifyRecover(func() error {
+				m.logger.Debugf("Processing MQTT message %s/%d", mqttMsg.Topic(), mqttMsg.MessageID())
+				return m.handleMessage(ctx, handler, mqttMsg)
+			}, b, func(err error, d time.Duration) {
+				m.logger.Errorf("Error processing MQTT message: %s/%d. Retrying...", mqttMsg.Topic(), mqttMsg.MessageID())
+			}, func() {
+				m.logger.Infof("Successfully processed MQTT message after it previously failed: %s/%d", mqttMsg.Topic(), mqttMsg.MessageID())
+			}); err != nil {
+				m.logger.Errorf("Failed processing MQTT message: %s/%d: %v", mqttMsg.Topic(), mqttMsg.MessageID(), err)
+			}
+		})
+		token.Wait()
+		if err := token.Error(); err != nil {
+			m.logger.Errorf("mqtt error from subscribe: %v", err)
+		}
+	})
 	if err != nil {
 		return err
 	}
 	m.consumer = c
 
-	m.logger.Debugf("mqtt subscribing to topic %s", m.metadata.topic)
-	token := m.consumer.Subscribe(m.metadata.topic, m.metadata.qos, func(client mqtt.Client, mqttMsg mqtt.Message) {
-		var b backoff.BackOff = backoff.WithContext(m.backOff, ctx)
-		if m.metadata.backOffMaxRetries >= 0 {
-			b = backoff.WithMaxRetries(b, uint64(m.metadata.backOffMaxRetries))
-		}
-
-		if err := retry.NotifyRecover(func() error {
-			m.logger.Debugf("Processing MQTT message %s/%d", mqttMsg.Topic(), mqttMsg.MessageID())
-			return m.handleMessage(ctx, handler, mqttMsg)
-		}, b, func(err error, d time.Duration) {
-			m.logger.Errorf("Error processing MQTT message: %s/%d. Retrying...", mqttMsg.Topic(), mqttMsg.MessageID())
-		}, func() {
-			m.logger.Infof("Successfully processed MQTT message after it previously failed: %s/%d", mqttMsg.Topic(), mqttMsg.MessageID())
-		}); err != nil {
-			m.logger.Errorf("Failed processing MQTT message: %s/%d: %v", mqttMsg.Topic(), mqttMsg.MessageID(), err)
-		}
-	})
-	if err := token.Error(); err != nil {
-		m.logger.Errorf("mqtt error from subscribe: %v", err)
-		return err
-	}
-
 	return nil
 }
 
-func (m *MQTT) connect(clientID string) (mqtt.Client, error) {
+func (m *MQTT) connect(clientID string, onConnectHandler func(mqtt.Client)) (mqtt.Client, error) {
 	uri, err := url.Parse(m.metadata.url)
 	if err != nil {
 		return nil, err
 	}
 	opts := m.createClientOptions(uri, clientID)
+	if onConnectHandler != nil {
+		opts.SetOnConnectHandler(onConnectHandler)
+	}
 	client := mqtt.NewClient(opts)
 	token := client.Connect()
 	for !token.WaitTimeout(defaultWait) {

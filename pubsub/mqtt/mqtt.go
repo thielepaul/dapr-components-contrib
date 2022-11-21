@@ -95,7 +95,7 @@ func (m *mqttPubSub) Init(metadata pubsub.Metadata) error {
 		producerClientID = m.metadata.consumerID + "-producer"
 	}
 	connCtx, connCancel := context.WithTimeout(m.ctx, defaultWait)
-	p, err := m.connect(connCtx, producerClientID)
+	p, err := m.connect(connCtx, producerClientID, nil)
 	connCancel()
 	if err != nil {
 		return err
@@ -213,33 +213,33 @@ func (m *mqttPubSub) startSubscription(ctx context.Context) error {
 		consumerClientID += "-consumer"
 	}
 	connCtx, connCancel := context.WithTimeout(ctx, defaultWait)
-	c, err := m.connect(connCtx, consumerClientID)
+	c, err := m.connect(connCtx, consumerClientID, func(c mqtt.Client) {
+		subscribeTopics := make(map[string]byte, len(m.topics))
+		for k := range m.topics {
+			subscribeTopics[k] = m.metadata.qos
+		}
+
+		token := c.SubscribeMultiple(
+			subscribeTopics,
+			m.onMessage(ctx),
+		)
+		subscribeCtx, subscribeCancel := context.WithTimeout(m.ctx, defaultWait)
+		defer subscribeCancel()
+		select {
+		case <-token.Done():
+			// Subscription went through
+		case <-subscribeCtx.Done():
+			m.logger.Errorf("context done, while waiting for subscribe: %v", subscribeCtx.Err())
+		}
+		if err := token.Error(); err != nil {
+			m.logger.Errorf("mqtt error from subscribe: %v", err)
+		}
+	})
 	connCancel()
 	if err != nil {
 		return err
 	}
 	m.consumer = c
-
-	subscribeTopics := make(map[string]byte, len(m.topics))
-	for k := range m.topics {
-		subscribeTopics[k] = m.metadata.qos
-	}
-
-	token := m.consumer.SubscribeMultiple(
-		subscribeTopics,
-		m.onMessage(ctx),
-	)
-	subscribeCtx, subscribeCancel := context.WithTimeout(m.ctx, defaultWait)
-	defer subscribeCancel()
-	select {
-	case <-token.Done():
-		// Subscription went through
-	case <-subscribeCtx.Done():
-		return subscribeCtx.Err()
-	}
-	if err := token.Error(); err != nil {
-		return fmt.Errorf("mqtt error from subscribe: %v", err)
-	}
 
 	return nil
 }
@@ -250,9 +250,9 @@ func (m *mqttPubSub) onMessage(ctx context.Context) func(client mqtt.Client, mqt
 		ack := false
 		defer func() {
 			// Do not send N/ACKs on retained messages
-			if mqttMsg.Retained() {
-				return
-			}
+			// if mqttMsg.Retained() {
+			// 	return
+			// }
 
 			// MQTT does not support NACK's, so in case of error we need to re-enqueue the message and then send a positive ACK for this message
 			// Note that if the connection drops before the message is explicitly ACK'd below, then it's automatically re-sent (assuming QoS is 1 or greater, which is the default). So we do not risk losing messages.
@@ -281,8 +281,9 @@ func (m *mqttPubSub) onMessage(ctx context.Context) func(client mqtt.Client, mqt
 		}()
 
 		msg := pubsub.NewMessage{
-			Topic: mqttMsg.Topic(),
-			Data:  mqttMsg.Payload(),
+			Topic:    mqttMsg.Topic(),
+			Data:     mqttMsg.Payload(),
+			Metadata: map[string]string{"retained": fmt.Sprint(mqttMsg.Retained())},
 		}
 
 		topicHandler := m.handlerForTopic(msg.Topic)
@@ -327,12 +328,15 @@ func (m *mqttPubSub) handlerForTopic(topic string) pubsub.Handler {
 	return nil
 }
 
-func (m *mqttPubSub) connect(ctx context.Context, clientID string) (mqtt.Client, error) {
+func (m *mqttPubSub) connect(ctx context.Context, clientID string, onConnectHandler func(mqtt.Client)) (mqtt.Client, error) {
 	uri, err := url.Parse(m.metadata.url)
 	if err != nil {
 		return nil, err
 	}
 	opts := m.createClientOptions(uri, clientID)
+	if onConnectHandler != nil {
+		opts.SetOnConnectHandler(onConnectHandler)
+	}
 	// Turn off auto-ack
 	opts.SetAutoAckDisabled(true)
 	client := mqtt.NewClient(opts)
